@@ -2,10 +2,12 @@ from logging import raiseExceptions
 import os
 import re
 import json
+from tqdm import tqdm
 import argparse
 
 import time
 from datetime import date, datetime, timedelta
+from numpy import not_equal
 
 import pandas as pd 
 
@@ -17,7 +19,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 def date_range(start, stop, step = timedelta(1)):
     current = start
     while current < stop:
-        yield re.sub('-', '', str(current))
+        yield current
         current += step
 
 def split_race_info(race_info):
@@ -91,177 +93,166 @@ def repeat_df(df, num):
 
     return df.reset_index()
 
-class ChromeDriver():
+class HorceDateCollecter():
     def __init__(self):
-        options = webdriver.ChromeOptions()
-        self.driver = webdriver.Chrome(ChromeDriverManager().install())
+        if not os.path.isdir('./data/'):
+            os.makedirs('./data/')
+            self.horse_ids = {}
+            self.jockey_ids = {}
+            self.trainer_ids = {}
+            self.owner_ids = {}
+        else:
+            # 馬のidを取得
+            if not os.path.isfile('./data/horses.json'):
+                self.horse_ids = {}
+            else:
+                with open('./data/horses.json', 'r') as f:
+                    self.horse_ids = json.load(f)
+            # 騎手のidを取得
+            if not os.path.isfile('./data/jockeys.json'):
+                self.jockey_ids = {}
+            else:
+                with open('./data/jockeys.json', 'r') as f:
+                    self.jockey_ids = json.load(f)
+            # 調教師のidを取得
+            if not os.path.isfile('./data/trainers.json'):
+                self.trainer_ids = {}
+            else:
+                with open('./data/trainers.json', 'r') as f:
+                    self.trainer_ids = json.load(f)
+            # 所有者のidを取得
+            if not os.path.isfile('./data/owners.json'):
+                self.owner_ids = {}
+            else:
+                with open('./data/owners.json', 'r') as f:
+                    self.owner_ids = json.load(f)
+
+        if not os.path.isdir('./data/race_data'):
+            os.makedirs('./data/race_data/')
+
+        if not os.path.isdir('./data/horse_data'):
+            os.makedirs('./data/horse_data/')
+
+        if not os.path.isdir('./data/pedigree_data'):
+            os.makedirs('./data/pedigree_data/')
+
+        # 前回の実行時刻を取得
+        try:
+            with open('last_updata_log.txt', 'r') as f:
+                self.start_date = datetime.strptime(f.read(), '%Y-%m-%d').date()
+        except FileNotFoundError:
+            # 前回のデータがない場合は1986年1月1日からスクレイピング
+            self.start_date = datetime(1986, 1, 1).date()
+            
 
         # 前回のデータとの差分をとって最新のデータのみ持ってくる
-        self.dt_today = datetime.datetime.utcnow().date()
+        self.dt_today = datetime.utcnow().date()
 
-    def getdriver(self):
-        return self.driver
+    def get_race_data(self):
+        for date in date_range(self.start_date, self.dt_today):
+            # データをとった日付を記録
+            with open('last_updata_log.txt', 'w') as f:
+                f.write(str(date))
 
-def main(args):
-    HTTP_PROXY = args.http_proxy
-    HTTPS_RPOXY = args.https_proxy
+            date = re.sub('-', '', str(date))
+            url = 'https://db.netkeiba.com/race/list/' + date
+            res = requests.get(url)
 
-    proxies = {
-        "http":HTTP_PROXY,
-        "https":HTTPS_RPOXY
-    }
+            soup = BeautifulSoup(res.content, 'html.parser')
+            hold_race = soup.select_one('div.race_kaisai_info')
+            if hold_race is None:
+                continue
 
-    # options = webdriver.ChromeOptions()
-    # driver = webdriver.Chrome(ChromeDriverManager().install(), options=options)
-    
-    if not os.path.isdir('./data/'):
-        os.makedirs('./data/')
-        horse_ids = {}
-        jockey_ids = {}
-        trainer_ids = {}
-        owner_ids = {}
-    else:
-        # 馬のidを取得
-        if not os.path.isfile('./data/horses.json'):
-            horse_ids = {}
-        else:
-            with open('./data/horses.json', 'r') as f:
-                horse_ids = json.load(f)
-        # 騎手のidを取得
-        if not os.path.isfile('./data/jockeys.json'):
-            jockey_ids = {}
-        else:
-            with open('./data/jockeys.json', 'r') as f:
-                jockey_ids = json.load(f)
-        # 調教師のidを取得
-        if not os.path.isfile('./data/trainers.json'):
-            trainer_ids = {}
-        else:
-            with open('./data/trainers.json', 'r') as f:
-                trainer_ids = json.load(f)
-        # 所有者のidを取得
-        if not os.path.isfile('./data/owners.json'):
-            owner_ids = {}
-        else:
-            with open('./data/owners.json', 'r') as f:
-                owner_ids = json.load(f)
+            print('get date {} now ...'.format(date))
 
-    if not os.path.isdir('./data/race_data'):
-        os.makedirs('./data/race_data/')
+            race_urls = hold_race.find_all('a', title=re.compile(r'.+'))
+            for index in tqdm(range(len(race_urls))):
+                race = race_urls[index].get('href')
+                url = 'https://db.netkeiba.com' + race
+                race_id = re.search(r'[0-9]+', race).group()
 
-    if not os.path.isdir('./data/horse_data'):
-        os.makedirs('./data/horse_data/')
+                res = requests.get(url)
+                soup = BeautifulSoup(res.content, 'html.parser')
 
-    if not os.path.isdir('./data/pedigree_data'):
-        os.makedirs('./data/pedigree_data/')
+                # 出走馬情報
+                df_horses = pd.read_html(url, match='馬名')[0]
+                info_ids = soup.select('td.txt_l a')
+                for info in info_ids:
+                    info_type = re.search(r'[a-z]+', info.get('href')).group()
+                    name = info.get_text()
+                    id = re.search(r'[0-9]+', info.get('href')).group()
 
-    # 前回の実行時刻を取得
-    try:
-        with open('last_updata_log.txt', 'r') as f:
-            start_date = f.read()
-    except FileNotFoundError:
-        # 前回のデータがない場合は1986年1月1日からスクレイピング
-        start_date = datetime(1986, 1, 1).date()
+                    if info_type == 'horse':
+                        if id not in self.horse_ids:
+                            self.horse_ids.update({name:id})
+                    elif info_type == 'jockey':
+                        if id not in self.jockey_ids:
+                            self.jockey_ids.update({name:id})
+                    elif info_type == 'trainer':
+                        if id not in self.trainer_ids:
+                            self.trainer_ids.update({name:id})
+                    elif info_type == 'owner':
+                        if id not in self.owner_ids:
+                            self.owner_ids.update({name:id})
 
-    # 実行時の日付までのデータを取得
-    dt_today = datetime.utcnow().date()
+                # レース情報　馬場距離/天候/状態/発走時刻
+                race_info = soup.select_one('div.data_intro diary_snap_cut span').get_text()
+                df_race_info = split_race_info(race_info)
+                df_race_info = repeat_df(df_race_info, len(df_horses))
+                # レース詳細 日付/回数/レース名/出走馬種
+                race_detail = soup.select_one('p.smalltxt').get_text()
+                df_race_detail = split_race_detail(race_detail)
+                df_race_detail = repeat_df(df_race_detail, len(df_horses))
 
-    for date in date_range(start_date, dt_today):
-        url = 'https://db.netkeiba.com/race/list/' + date
-        res = requests.get(url)
+                df_race = pd.concat([df_horses, df_race_info, df_race_detail], axis=1)
 
-        soup = BeautifulSoup(res.content, 'html.parser')
-        hold_race = soup.select_one('div.race_kaisai_info')
-        if hold_race is None:
-            continue
+                df_race.to_csv('./data/race_data/' + race_id + '.csv', index=False)
 
-        print('get date {} now ...'.format(date))
+                time.sleep(2)
 
-        race_urls = hold_race.find_all('a', title=re.compile(r'.+'))
-        for race in race_urls:
-            race = race.get('href')
-            url = 'https://db.netkeiba.com' + race
-            race_id = re.search(r'[0-9]+', race).group()
+            # 各日付ごとに逐一保存
+            self._save_ids()
+
+    def get_horse_date(self):
+        # 馬の情報の取得
+        for horse_name, horse_id in self.horse_ids.items():
+            print('get {} datas ...'.format(horse_name))
+
+            url = 'https://db.netkeiba.com/horse/' + horse_id
 
             res = requests.get(url)
             soup = BeautifulSoup(res.content, 'html.parser')
 
-            # 出走馬情報
-            df_horses = pd.read_html(url, match='馬名')[0]
-            info_ids = soup.select('td.txt_l a')
-            for info in info_ids:
-                info_type = re.search(r'[a-z]+', info.get('href')).group()
-                name = info.get_text()
-                id = re.search(r'[0-9]+', info.get('href')).group()
+            df_horse = pd.read_html(url, match='レース名')[0]
 
-                if info_type == 'horse':
-                    if id not in horse_ids:
-                        horse_ids.update({id:name})
-                elif info_type == 'jockey':
-                    if id not in jockey_ids:
-                        jockey_ids.update({id:name})
-                elif info_type == 'trainer':
-                    if id not in trainer_ids:
-                        trainer_ids.update({id:name})
-                elif info_type == 'owner':
-                    if id not in owner_ids:
-                        owner_ids.update({id:name})
+            df_horse.to_csv('./data/horse_data/' + horse_id + '.csv', index=False)
 
-            # レース情報　馬場距離/天候/状態/発走時刻
-            race_info = soup.select_one('div.data_intro diary_snap_cut span').get_text()
-            df_race_info = split_race_info(race_info)
-            df_race_info = repeat_df(df_race_info, len(df_horses))
-            # レース詳細 日付/回数/レース名/出走馬種
-            race_detail = soup.select_one('p.smalltxt').get_text()
-            df_race_detail = split_race_detail(race_detail)
-            df_race_detail = repeat_df(df_race_detail, len(df_horses))
+            time.sleep(2)
 
-            df_race = pd.concat([df_horses, df_race_info, df_race_detail], axis=1)
+    def _save_ids(self):
+        # 馬のidを保存
+        with open('./data/horses.json', 'w') as f:
+            json.dump(self.horse_ids, f, ensure_ascii=False, indent=2)
+        # 騎手のidを保存
+        with open('./data/jockeys.json', 'w') as f:
+            json.dump(self.jockey_ids, f, ensure_ascii=False, indent=2)
+        # 調教師のidを保存
+        with open('./data/trainers.json', 'w') as f:
+            json.dump(self.trainer_ids, f, ensure_ascii=False, indent=2)
+        # 所有者のidを保存
+        with open('./data/owners.json', 'w') as f:
+            json.dump(self.owner_ids, f, ensure_ascii=False, indent=2)
 
-            df_race.to_csv('./data/race_data/' + race_id + '.csv', index=False)
+def main(args):
 
-            time.sleep(3)
+    horce_collect = HorceDateCollecter()
 
-    # 馬の情報の取得
-    for horse_id in horse_ids.values():
-        url = 'https://db.netkeiba.com/horse/' + horse_id
+    horce_collect.get_race_data()
 
-        res = requests.get(url)
-        soup = BeautifulSoup(res.content, 'html.parser')
-
-        df_horse = pd.read_html(url, match='レース名')[0]
-
-        df_horse.to_csv('./data/horse_data/' + horse_id + '.csv', index=False)
-
-        time.sleep(3)
-
-    # 馬の血統の取得
-    # めんどくさいので後にする
-    time.sleep(1)
-
-    # driver.get(url)
-
-    # driver.quit()
-
-    # 実行した日付を記録
-    with open('last_updata_log.txt', 'w') as f:
-        f.write(str(dt_today))
-
-    # 馬のidを保存
-    with open('./data/horses.json', 'w') as f:
-        json.dump(horse_ids, f, ensure_ascii=False)
-    # 騎手のidを保存
-    with open('./data/jockeys.json', 'w') as f:
-        json.dump(jockey_ids, f, ensure_ascii=False)
-    # 調教師のidを保存
-    with open('./data/trainers.json', 'w') as f:
-        json.dump(trainer_ids, f, ensure_ascii=False)
-    # 所有者のidを保存
-    with open('./data/owners.json', 'w') as f:
-        json.dump(owner_ids, f, ensure_ascii=False)
+    horce_collect.get_horse_date()
+    
     
 if __name__=='__main__':
-
     parser = argparse.ArgumentParser()
     parser.add_argument('--http_proxy', default='')
     parser.add_argument('--https_proxy', default='')
