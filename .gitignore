@@ -133,3 +133,9 @@ last_updata_log.txt
 *.json
 
 .vscode
+
+todolist.md
+log
+*.pickle
+*.ipynb
+*.html
