@@ -2,6 +2,7 @@ from logging import raiseExceptions
 import os
 import re
 import regex
+import glob
 import json
 from tqdm import tqdm
 import argparse
@@ -50,12 +51,16 @@ def split_race_info(race_info, race_title, race_round):
         race_line = 'out'
         if race_status[1] == '右':
             race_rotation = 'right'
+        elif race_status[1] == '直線':
+            race_rotation = 'straight'
         else:
             race_rotation = 'left'
     else:
         race_line = 'in'
         if race_status[1] == '右':
             race_rotation = 'right'
+        elif race_status[1] == '直線':
+            race_rotation = 'straight'
         else:
             race_rotation = 'left'
 
@@ -322,17 +327,50 @@ class HorceDateCollecter():
 
         self._save_ids()
 
+def complement_horse_name():
+    """現状馬のデータをスクレイピングしても名前がjsonに登録されない馬がいるので
+        それを補完するプログラム
+    """
+    with open('./data/horses.json') as f:
+        horse_db = json.load(f)
+    horse_csvs = glob.glob('./data/horse_data/*')
+    horse_ids = [os.path.splitext(os.path.basename(path))[0] for path in horse_csvs]
+    katakana = re.compile('[\u30A1-\u30FF]+')
+    
+    for i in tqdm(range(len(horse_ids))):
+        horse_name = [k for k, v in horse_db.items() if v == horse_ids[i]][0]
+        if katakana.search(horse_name):
+            continue
+        del horse_db[horse_name]
+        url = 'https://db.netkeiba.com/horse/' + str(horse_ids[i])
+        res = requests.get(url)
+        res.encoding = res.apparent_encoding
+        soup = BeautifulSoup(res.content, 'html.parser')
+        horse_name = soup.select_one('div.db_head_name.fc div.horse_title h1').get_text()
+        horse_name = katakana.search(horse_name).group()
+        print(horse_name)
+        # 空白の削除
+        horse_name = re.sub(r'\s', '', horse_name)
+        time.sleep(1)
+        if horse_name not in horse_db.keys():
+            horse_db.update({horse_name:horse_ids[i]})
+
+    with open('./data/horses.json', 'w') as f:
+            json.dump(horse_db, f, ensure_ascii=False, indent=2)
+        
 def main(args):
 
-    horce_collect = HorceDateCollecter()
+    # horce_collect = HorceDateCollecter()
 
-    horce_collect.get_race_data()
+    # horce_collect.get_race_data()
 
-    horce_collect.get_horse_date()
+    # horce_collect.get_horse_date()
 
     # horce_collect.get_correct_jockey_name()
 
     # horce_collect.fix_garbled_char()
+
+    complement_horse_name()
     
 if __name__=='__main__':
     parser = argparse.ArgumentParser()

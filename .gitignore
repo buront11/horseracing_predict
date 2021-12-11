@@ -135,6 +135,7 @@ last_updata_log.txt
 .vscode
 
 todolist.md
+horse_memo.md
 log
 *.pickle
 *.ipynb
