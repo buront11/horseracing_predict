@@ -4,70 +4,34 @@ import networkx as nx
 
 import dgl
 
+from tqdm import tqdm
 import torch
 from torch.utils.data import Dataset
+
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+
+# TODO このままだとtest datasetの読み出しに時間がかかるため後で改善する
 
 class HorceDataset(Dataset):
     def __init__(self, data_type='train'):
         super(HorceDataset, self).__init__()
         # 前処理済みのレースごとの読み込み
-        with open('preprocessed_race_data.pickle', 'rb') as f:
-            dfs = pickle.load(f)
-
-        self.train_graph_datas = []
-        self.train_graph_labels = []
-
-        self.test_graph_datas = []
-        self.test_graph_labels = []
-
-        for df in dfs:
-            self.df2graph()
-
-        if data_type == 'train':
-            self.datas = self.train_graph_datas
-            self.labels = self.train_graph_labels
+        print('loading graph datas...')
+        if data_type=='train':
+            with open('./train_data', 'rb') as f:
+                self.datas = pickle.load(f)
+            with open('./train_label', 'rb') as f:
+                self.labels = pickle.load(f)
         else:
-            self.datas = self.test_graph_datas
-            self.labels = self.test_graph_labels
+            with open('./test_data', 'rb') as f:
+                self.datas = pickle.load(f)
+            with open('./test_label', 'rb') as f:
+                self.labels = pickle.load(f)
 
-    def df2graph(self, df):
-        # 全てのdfの時間は共通
-        if df['year'][0] == '2021':
-            test_flag = True
-        else:
-            test_flag = False
-
-        # デフォルトだと一番上の要素が着順で1位になるため、dfの行をシャッフルする
-        df = df.sample(frac=1)
-
-        # 一位の行を取得
-        label_index = df.index[df['arrival'] == 1].tolist()[0]
-
-        drop_cols = ['sex_old', 'start_time','title', 'date', 'year', 'month', 'day',\
-                    'time', 'passing', 'pace', 'down_flag', 'up_pace', 'down_pace', 'arrival',\
-                    'horse_name', 'jockey', 'trainer']
-
-        df = df.drop(drop_cols, axis=1)
-
-        # 年齢がstrだったのでintに変換
-        # TODO 前処理の段階で直すようにする
-        df['old'] = df['old'].astype(int)
-        
-        # 出馬している馬の頭数
-        horse_num = len(df)
-        # 出馬している馬の頭数分の完全グラフを作成する
-        graph = nx.complete_graph(horse_num)
-
-        for index, row in enumerate(df.values.tolist()):
-            graph.nodes[index]['feat'] = row
-
-        dgl_graph = dgl.from_networkx(graph, node_attrs=['feat'], device='cuda')
-        if test_flag:
-            self.test_graph_datas.append(dgl_graph)
-            self.test_graph_labels.append(label_index)
-        else:
-            self.test_graph_datas.append(dgl_graph)
-            self.test_graph_labels.append(label_index)
+    def __len__(self):
+        return len(self.datas)
 
     def __getitem__(self, idx):
         out_data = self.datas[idx]
@@ -75,5 +39,49 @@ class HorceDataset(Dataset):
 
         return out_data, out_label
 
+class NodeClassifierDataset(Dataset):
+    def __init__(self, data_type='train'):
+        super(NodeClassifierDataset, self).__init__()
+        # 前処理済みのレースごとの読み込み
+        print('loading graph datas...')
+        if data_type=='train':
+            with open('./train_data', 'rb') as f:
+                self.datas = pickle.load(f)
+        else:
+            with open('./test_data', 'rb') as f:
+                self.datas = pickle.load(f)
+        print(self.datas[0])
+
+    def __len__(self):
+        return len(self.datas)
+
+    def __getitem__(self, idx):
+        out_data = self.datas[idx]
+
+        return out_data
+
+class LightGBMDataset(Dataset):
+    def __init__(self, dataset):
+        super(LightGBMDataset, self).__init__()
+
+        self.dataset = dataset
+
+        self.dataset['label'] = self.dataset['arrival'].apply(lambda x: x if (x==1 or x==2 or x==3) else 0)
+
+        self.datas = self.dataset.drop('label', axis=1)
+        self.labels = self.dataset['label']
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        out_data = self.datas[idx]
+        out_label = self.labels[idx]
+
+        return out_data, out_label
+
+    
+
+
 if __name__=='__main__':
-    HorceDataset()
+    dataset = LightGBMDataset()

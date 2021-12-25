@@ -49,20 +49,10 @@ def split_race_info(race_info, race_title, race_round):
     race_status = re.sub(r'[0-9０-９]+m', '', race_infos[0])
     if len(race_status) == 3:
         race_line = 'out'
-        if race_status[1] == '右':
-            race_rotation = 'right'
-        elif race_status[1] == '直線':
-            race_rotation = 'straight'
-        else:
-            race_rotation = 'left'
+        race_rotation= race_status[1]
     else:
         race_line = 'in'
-        if race_status[1] == '右':
-            race_rotation = 'right'
-        elif race_status[1] == '直線':
-            race_rotation = 'straight'
-        else:
-            race_rotation = 'left'
+        race_rotation = race_status[1]
 
     race_infos = [[race_type, race_condition, race_distance, race_weather,
                     race_line, race_rotation, race_start_time, race_title, race_round]]
@@ -186,7 +176,7 @@ class HorceDateCollecter():
                 soup = BeautifulSoup(res.content, 'html.parser')
 
                 # 出走馬情報
-                df_horses = pd.read_html(url, match='馬名')[0]
+                df_horses = pd.read_html(res, match='馬名')[0]
                 info_ids = soup.select('td.txt_l a')
                 for info in info_ids:
                     info_type = re.search(r'[a-z]+', info.get('href')).group()
@@ -245,7 +235,7 @@ class HorceDateCollecter():
             res.encoding = res.apparent_encoding
             soup = BeautifulSoup(res.content, 'html.parser')
 
-            df_horse = pd.read_html(url, match='レース名')[0]
+            df_horse = pd.read_html(res, match='レース名')[0]
 
             df_horse.to_csv('./data/horse_data/' + horse_id + '.csv', index=False)
 

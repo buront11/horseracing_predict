@@ -5,6 +5,7 @@ import argparse
 import category_encoders as ce
 import re
 import os
+import networkx as nx
 import requests
 from bs4 import BeautifulSoup
 import regex
@@ -12,6 +13,8 @@ import math
 import numpy as np
 from datetime import datetime
 from fractions import Fraction
+
+import dgl
 
 from tqdm import tqdm
 
@@ -35,31 +38,41 @@ class Preprocess():
             with open('./preprocessed_horse_df.pickle', 'rb') as f:
                 self.horse_dfs = pickle.load(f)
 
-        self.race_datas = glob.glob('./data/race_data/*')
-        print('loading race datas...')
-        self.race_dfs = [pd.read_csv(str(self.race_datas[i])) for i in tqdm(range(len(self.race_datas)))]
+        if args.race or not(os.path.isfile('./preprocessed_race_data.pickle')):
+            self.race_datas = glob.glob('./data/race_data/*')
+            print('loading race datas...')
+            self.race_dfs = [pd.read_csv(str(self.race_datas[i])) for i in tqdm(range(len(self.race_datas)))]
 
-        self.race_df = pd.concat(self.race_dfs, sort=False)
-        self.race_df = self._trans_eng_race_col(self.race_df)
-        self.race_df = self._split_sex_old(self.race_df)
-        # self.race_df = self._time_convert2sec(self.race_df)
+            self.race_df = pd.concat(self.race_dfs, sort=False)
+            self.race_df = self._trans_eng_race_col(self.race_df)
+            self.race_df = self._split_sex_old(self.race_df)
+            # self.race_df = self._time_convert2sec(self.race_df)
 
-        self.graph_datas = []
+            # onehot vecに変換する列
+            # TODO タイトルを含めるか否か　含めるなら前処理は必要
+            # sex, race_type, distance, condition, distance, weather, race_line, rotation, location, sub_title
+            self.onehot_cols = ['sex','race_type', 'condition', 'weather', 'race_line','distance',
+                            'rotation','location', 'sub_title']
 
-        # onehot vecに変換する列
-        # TODO タイトルを含めるか否か　含めるなら前処理は必要
-        # sex, race_type, distance, condition, distance, weather, race_line, rotation, location, sub_title
-        self.onehot_cols = ['sex','race_type', 'condition', 'weather', 'race_line','distance',
-                        'rotation','location', 'sub_title']
+            self.bine = ce.OneHotEncoder(cols=self.onehot_cols,handle_unknown='impute')
+            self.bine.fit(self.race_df.loc[:,self.onehot_cols])
 
-        self.bine = ce.OneHotEncoder(cols=self.onehot_cols,handle_unknown='impute')
-        self.bine.fit(self.race_df.loc[:,self.onehot_cols])
+            # カテゴリ変数変換する列
+            # 馬名　騎手　調教師　x馬主:データ取れてない
+            self.ordinal_cols = ['horse_name', 'jockey', 'trainer']
+            self.ce_oe = ce.OrdinalEncoder(cols=self.ordinal_cols,handle_unknown='impute')
+            self.ce_oe.fit(self.race_df.loc[:,self.ordinal_cols])
 
-        # カテゴリ変数変換する列
-        # 馬名　騎手　調教師　x馬主:データ取れてない
-        self.ordinal_cols = ['horse_name', 'jockey', 'trainer']
-        self.ce_oe = ce.OrdinalEncoder(cols=self.ordinal_cols,handle_unknown='impute')
-        self.ce_oe.fit(self.race_df.loc[:,self.ordinal_cols])
+            self.race_preprocess()
+        else:
+            print('loading race data...')
+            with open('./preprocessed_race_data.pickle', 'rb') as f:
+                self.race_dfs = pickle.load(f)
+
+        self.train_graph_datas = []
+        self.train_graph_labels = []
+        self.test_graph_datas = []
+        self.test_graph_labels = []
 
     def _trans_eng_race_col(self, df):
         # レースのdfの列名を英語に変換
@@ -111,7 +124,9 @@ class Preprocess():
 
         df['sex'] = sex
         df['old'] = old
-
+        df['old'] = df['old'].astype(int)
+        df['old'] = df['old'].fillna(df['old'].mean().astype(int))
+        
         return df
 
     def _time_convert2sec(self, df):
@@ -226,6 +241,7 @@ class Preprocess():
         df['weight'] = df['weight'].fillna(df['weight'].mean().astype(int))
         # 秒数に変換してからnanを処理する
         df = self._time_convert2sec(df)
+        # TODO 時間形は平均で取ると距離を考えた時におかしくなるので過去データを使うときに修正する
         df['sec_time'] = df['sec_time'].fillna(df['sec_time'].mean())
         df['arrival_diff'] = df['arrival_diff'].fillna(0)
         # 馬体重の分割後、計測不可を処理
@@ -237,6 +253,8 @@ class Preprocess():
             df['horse_weight'] = df['horse_weight'].fillna(470)
         # 失格は最下位以下の順位とする
         df['arrival'] = df['arrival'].fillna(19)
+        # TODO 3fも同じ理由で後で修正、今はとりあえず動かすために放置
+        df['3f'] = df['3f'].fillna(df['3f'].mean())
 
         return df
 
@@ -254,16 +272,26 @@ class Preprocess():
             # 日付の同じ馬のデータを抽出する
             horse_datas.append(horse_df[horse_df['date'] == race_date])
 
-        add_df = pd.concat(horse_datas, sort=False)
-        try:
-            # なぜかweatherとdistanceが消されない場合があるので明示的に削除する
-            add_df = add_df.drop(['weather', 'distance'], axis=1)
-        except:
-            pass
+        add_df = pd.concat(horse_datas, sort=False).reset_index()
+        
+        # 重複している列を削除
+        drop_cols = ['weather', 'distance','date', 'jockey', 'weight',\
+                 'condition','round', 'number', 'horse_num', 'popularity']
+        for col in drop_cols:
+            if col in add_df.columns:
+                add_df = add_df.drop([col], axis=1)
 
-        df = pd.merge(df, add_df, how='outer',\
-             on=['date', 'jockey', 'weight', 'condition','round', 'number', 'horse_num', 'popularity']
-                 ).reset_index(drop=True)
+        # なぜか削除されていないケースが存在するので明示的に削除する
+        drop_cols = ['hold', 'weather', 'race_title', '映像', 'distance', \
+                '馬場指数', 'ﾀｲﾑ指数', '厩舎ｺﾒﾝﾄ', '備考', 'second_horse', 'winning']
+        for col in drop_cols:
+            if col in add_df.columns:
+                add_df = add_df.drop([col], axis=1)
+
+        # df = pd.merge(df, add_df, how='outer',\
+        #      on=['date', 'jockey', 'weight', 'condition','round', 'number', 'horse_num', 'popularity']
+        #          ).reset_index(drop=True)
+        df = pd.concat([df, add_df], join='outer', axis=1).reset_index(drop=True)
 
         return df
 
@@ -350,8 +378,61 @@ class Preprocess():
 
         return df
 
+    def _make_label(self, df):
+        labels = []
+        for arrival in df['arrival']:
+            if arrival == 1 or arrival == 2:
+                labels.append(1)
+            else:
+                labels.append(0)
+
+        df['label'] = labels
+
+        return df
+
+    def single_race_preprocess(self):
+        print('load single data...')
+        self.race_datas = glob.glob('./data/race_data/*')
+        self.race_dfs = [pd.read_csv(str(self.race_datas[i])) for i in tqdm(range(len(self.race_datas)))]
+        self.race_df = pd.concat(self.race_dfs, sort=False)
+
+        # 列名を英語に変換
+        self.race_df = self._trans_eng_race_col(self.race_df)
+        # 性別と年齢の追加(列数を合わせるため)
+        self.race_df = self._split_sex_old(self.race_df)
+        # 不要な列(馬のデータの方に存在しており前処理が不必要なデータ)を削除
+        # 着差とタイム
+        self.race_df = self.race_df.drop(['arrival','time','arrival_diff',\
+            'horse_weight'], axis=1)
+        # レースの情報以外は馬のデータから取ってくる
+        # idは不要だったので消す
+        self.race_df = self.race_df.drop(['horse_id','jockey_id','trainer_id','owner_id'], axis=1)
+        # 馬のデータを結合する
+        self.race_df = self._get_horse_data(self.race_df)
+        # timeがnanの場合出走していないので削除
+        self.race_df = self.race_df.dropna(subset=['time'])
+        # オッズがstrになっているのでfloat変換
+        self.race_df['win_rate'] = self.race_df['win_rate'].astype(float)
+        self.race_df = self._make_label(self.race_df)
+
+        self.onehot_cols = ['sex','race_type', 'condition', 'weather', 'race_line','distance',
+                            'rotation','location', 'sub_title']
+
+        self.bine = ce.OneHotEncoder(cols=self.onehot_cols,handle_unknown='impute')
+        self.bine.fit_transform(self.race_df)
+
+        # カテゴリ変数変換する列
+        # 馬名　騎手　調教師　x馬主:データ取れてない
+        self.ordinal_cols = ['horse_name', 'jockey', 'trainer']
+        self.ce_oe = ce.OrdinalEncoder(cols=self.ordinal_cols,handle_unknown='impute')
+        self.ce_oe.fit_transform(self.race_df)
+
+        with open('preprocessed_race_data.pickle', 'wb') as f:
+            pickle.dump(self.race_dfs, f)
+
     def race_preprocess(self):
         print('preprocessing race datas...')
+        del_df_index = []
         for i in tqdm(range(len(self.race_dfs))):
             # 列名を英語に変換
             self.race_dfs[i] = self._trans_eng_race_col(self.race_dfs[i])
@@ -366,7 +447,10 @@ class Preprocess():
             self.race_dfs[i] = self.race_dfs[i].drop(['horse_id','jockey_id','trainer_id','owner_id'], axis=1)
             # 馬のデータを結合する
             self.race_dfs[i] = self._get_horse_data(self.race_dfs[i])
-            df = self.race_dfs[i]
+            # timeがnanの場合出走していないので削除
+            self.race_dfs[i] = self.race_dfs[i].dropna(subset=['time'])
+            # オッズがstrになっているのでfloat変換
+            self.race_dfs[i]['win_rate'] = self.race_dfs[i]['win_rate'].astype(float)
             # カテゴリ変数をonehot encoding
             self.race_dfs[i] = pd.concat([self.race_dfs[i], \
                 self.bine.transform(self.race_dfs[i].loc[:,self.onehot_cols])], axis=1)
@@ -414,15 +498,127 @@ class Preprocess():
         with open('preprocessed_horse_df.pickle', 'wb') as f:
             pickle.dump(self.horse_dfs, f)
 
+    def make_dataset(self):
+        print('Converting DataFrame to Graph...')
+        for i in tqdm(range(len(self.race_dfs))):
+            self._df2graph(self.race_dfs[i])
+
+        with open('train_data', 'wb') as f:
+            pickle.dump(self.train_graph_datas, f)
+        with open('train_label', 'wb') as f:
+            pickle.dump(self.train_graph_labels, f)
+
+        with open('test_data', 'wb') as f:
+            pickle.dump(self.test_graph_datas, f)
+        with open('test_label', 'wb') as f:
+            pickle.dump(self.test_graph_labels, f)
+
+    # TODO これ自体を前処理とする
+    def _df2graph(self, df):
+        # 全てのdfの時間は共通
+        if df.empty:
+            return
+        
+        if df['year'][0] == 2021:
+            test_flag = True
+        else:
+            test_flag = False
+
+        # 馬の番号順に並び替える
+        df = df.sort_values('horse_num').reset_index(drop=True)
+
+        df.loc[df['arrival'] == 1, 'label'] = 1
+        df.loc[df['arrival'] != 1, 'label'] = 0
+
+        # 一位の行を取得
+        # TODO なぜか1位がないレースがあるので前処理段階で弾くor修正する
+        try:
+            label_index = df.index[df['arrival'] == 1].tolist()[0]
+        except:
+            return
+
+        # print(df.loc[:, ['horse_num', 'horse_name', 'arrival']])
+
+        drop_cols = ['sex_old', 'start_time','title', 'date', 'year', 'month', 'day',\
+                    'time', 'passing', 'pace', 'down_flag', 'up_pace', 'down_pace', 'arrival',\
+                    'horse_name', 'jockey', 'trainer']
+
+        df = df.drop(drop_cols, axis=1)
+
+        # 出馬している馬の頭数
+        horse_num = len(df)
+        # 出馬している馬の頭数分の完全グラフを作成する
+        graph = nx.complete_graph(horse_num)
+
+        for index, row in enumerate(df.drop(['label'], axis=1).values.tolist()):
+            graph.nodes[index]['feat'] = [row]
+
+        for index, row in enumerate(df['label'].values.tolist()):
+            if row == 1:
+                graph.nodes[index]['label'] = [0,1]
+            else:
+                graph.nodes[index]['label'] = [1,0]
+
+        dgl_graph = dgl.from_networkx(graph, node_attrs=['feat', 'label'], device='cuda')
+        
+        if test_flag:
+            self.test_graph_datas.append(dgl_graph)
+            self.test_graph_labels.append(label_index)
+        else:
+            self.train_graph_datas.append(dgl_graph)
+            self.train_graph_labels.append(label_index)
+
+    def lightgbm_preprocess(self):
+        self.race_df = pd.read_pickle('./concat_df.pickle')
+        
+        self.race_df = self._trans_eng_race_col(self.race_df)
+        self.race_df = self._split_sex_old(self.race_df)
+
+        self.onehot_cols = ['sex','race_type', 'condition', 'weather', 'race_line','distance',
+                            'rotation','location', 'sub_title']
+
+        print('convert to onehot')
+        self.bine = ce.OneHotEncoder(cols=self.onehot_cols,handle_unknown='impute')
+        self.race_df = self.bine.fit_transform(self.race_df)
+
+        print('convert to ordinaly')
+        # カテゴリ変数変換する列
+        # 馬名　騎手　調教師　x馬主:データ取れてない
+        self.ordinal_cols = ['horse_name', 'jockey', 'trainer']
+        self.ce_oe = ce.OrdinalEncoder(cols=self.ordinal_cols,handle_unknown='impute')
+        self.race_df = self.ce_oe.fit_transform(self.race_df)
+
+        self.race_df['label'] = self.race_df['arrival'].apply(lambda x: 1 if (x==1 or x==2 or x==3) else 0)
+
+        drop_cols = ['arrival', 'time', 'arrival_diff', 'popularity', 'start_time', 'title',\
+             'date', 'year', 'day', 'horse_id', 'trainer_id', 'jockey_id', 'owner_id', 'trainer', 'horse_weight']
+
+        self.race_df = self.race_df.drop(drop_cols, axis=1)
+        self.race_df = self.race_df.drop('sex_old', axis=1)
+        self.race_df = self.race_df[~(self.race_df['win_rate'] == '---')]
+        self.race_df['win_rate'] = self.race_df['win_rate'].astype(float)
+        # self.race_df = self.race_df.drop(self.ordinal_cols, axis=1)
+
+        print(self.race_df.info(verbose=True, show_counts=True))
+
+        print(self.race_df.head(3))
+
+        # print('get horse data')
+        # race_df = self._get_horse_data(self.race_df)
+
+        with open('./lightgbm_dataset.pickle', 'wb') as f:
+            pickle.dump(self.race_df, f)
+
 def main(args):
     pp = Preprocess(args)
 
-    pp.race_preprocess()
+    pp.lightgbm_preprocess()
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--race', action='store_true')
     parser.add_argument('--horse', action='store_true')
+    parser.add_argument('--graph', action='store_true')
 
     args = parser.parse_args()
 
